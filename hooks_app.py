@@ -35,6 +35,7 @@ import inspect
 import io
 import random
 import unicodedata
+from collections import Counter
 from itertools import combinations
 from pathlib import Path
 
@@ -84,9 +85,14 @@ T = {
         "showing": "Pokazano {k} z {t} — CSV zawiera wszystkie.",
         "view_table": "Tabela", "view_text": "Tekst",
         "csv": "Eksport CSV ({k} wierszy)", "download": "⬇️ Pobierz", "empty": "Brak wyników.",
+        "c_bs": "rdzenie▶", "c_nbw": "słowa▶", "c_fs": "◀rdzenie", "c_nfw": "◀słowa",
+        "sort_few": "najmniej haków",
+        "unique": "tylko jednoznaczne", "unique_help": "Tylko jeden układ odrzucenia liter daje hak po wybranej stronie i jest to dokładnie jedna litera — zadanie ma jedno rozwiązanie (przy „wszystkie”: jedno w sumie, z przodu albo z tyłu).",
+        "computing": "Liczę wszystkie pary liter…",
+        "summary_any": "**{k}** słów · {b} z hakiem z tyłu ({ub} jednoznacznych) · {f} z hakiem z przodu ({uf} jednoznacznych)",
         "legend": ("**wzór** — słowo z odrzuconymi literami jako `·` · "
                    "**◀ przód / tył ▶** — litery, które dołożone do rdzenia dają słowo ze słownika · "
-                   "**zapis** — przód‑RDZEŃ‑tył, `Ø` = brak haka."),
+                   "**zapis** — przód‑RDZEŃ‑tył, `Ø` = brak haka · dokładana litera jest zawsze inna niż dwie odrzucone."),
     },
     "es": {
         "title": "Ganchos de dos letras",
@@ -115,9 +121,14 @@ T = {
         "showing": "Mostrando {k} de {t} — el CSV las lleva todas.",
         "view_table": "Tabla", "view_text": "Texto",
         "csv": "Exportar CSV ({k} filas)", "download": "⬇️ Descargar", "empty": "Ningún resultado.",
+        "c_bs": "raíces▶", "c_nbw": "palabras▶", "c_fs": "◀raíces", "c_nfw": "◀palabras",
+        "sort_few": "menos ganchos",
+        "unique": "solo unívocas", "unique_help": "Un solo patrón de eliminación da gancho por el lado elegido y es una sola letra: el problema tiene una única solución (con «todas»: una en total, delante o detrás).",
+        "computing": "Calculando todos los pares de letras…",
+        "summary_any": "**{k}** palabras · {b} con gancho detrás ({ub} unívocas) · {f} con gancho delante ({uf} unívocas)",
         "legend": ("**patrón** — la palabra con las letras quitadas como `·` · "
                    "**◀ delante / detrás ▶** — letras que, añadidas a la raíz, dan una palabra del diccionario · "
-                   "**notación** — delante‑RAÍZ‑detrás, `Ø` = sin gancho."),
+                   "**notación** — delante‑RAÍZ‑detrás, `Ø` = sin gancho · la letra añadida es siempre distinta de las dos quitadas."),
     },
     "en": {
         "title": "Two-letter hooks",
@@ -146,9 +157,14 @@ T = {
         "showing": "Showing {k} of {t} — the CSV has them all.",
         "view_table": "Table", "view_text": "Text",
         "csv": "Export CSV ({k} rows)", "download": "⬇️ Download", "empty": "No results.",
+        "c_bs": "stems▶", "c_nbw": "words▶", "c_fs": "◀stems", "c_nfw": "◀words",
+        "sort_few": "fewest hooks",
+        "unique": "unambiguous only", "unique_help": "Only one elimination pattern yields a hook on the chosen side and it is a single letter — the puzzle has one solution (with “all”: one in total, front or back).",
+        "computing": "Computing every pair of letters…",
+        "summary_any": "**{k}** words · {b} with a back hook ({ub} unambiguous) · {f} with a front hook ({uf} unambiguous)",
         "legend": ("**pattern** — the word with the dropped letters shown as `·` · "
                    "**◀ front / back ▶** — letters that, added to the stem, give a dictionary word · "
-                   "**notation** — front‑STEM‑back, `Ø` = no hook."),
+                   "**notation** — front‑STEM‑back, `Ø` = no hook · the added letter is always different from the two dropped ones."),
     },
 }
 
@@ -260,7 +276,11 @@ def analyse_word(lex: Lexicon, word: str, any_two: bool) -> list[dict]:
         stems.setdefault(stem, []).append(pattern.upper())
     rows = []
     for stem, patterns in stems.items():
+        # The added letter must differ from the two dropped ones.
+        dropped = set((Counter(word) - Counter(stem)).elements())
         front, back = lex.hooks(stem)
+        front = [c for c in front if c not in dropped]
+        back = [c for c in back if c not in dropped]
         f, b = lex.letters(front), lex.letters(back)
         words = [c + stem for c in front] + [stem + c for c in back]
         rows.append(
@@ -298,8 +318,9 @@ def length_table(key: str, n: int) -> pd.DataFrame:
             front.setdefault(tail, []).append(s[0])
     rows = []
     for w in words:
-        b = back.get(w[:-2], ())
-        f = front.get(w[2:], ())
+        # The added letter must differ from the two dropped ones.
+        b = [c for c in back.get(w[:-2], ()) if c not in w[-2:]]
+        f = [c for c in front.get(w[2:], ()) if c not in w[:2]]
         rows.append(
             (
                 w.upper(),
@@ -314,6 +335,61 @@ def length_table(key: str, n: int) -> pd.DataFrame:
         )
     return pd.DataFrame(
         rows, columns=["word", "end", "back", "nb", "start", "front", "nf", "total"]
+    )
+
+
+@st.cache_data(show_spinner=False)
+def any_table(key: str, n: int) -> pd.DataFrame:
+    """All words of length n, dropping ANY two letters.
+
+    For each word: how many stems admit a back hook, how many resulting words
+    that gives in total, and the list of solutions (same for front hooks).
+    A word with exactly one resulting word on a side is unambiguous there:
+    the puzzle "drop two letters, add one at that end" has a single answer."""
+    lex = registry()[key]
+    words = lex.sorted_by_len.get(n, ())
+    shorter = lex.by_len.get(n - 1, frozenset())
+    back: dict[str, list[str]] = {}
+    front: dict[str, list[str]] = {}
+    for s in shorter:
+        back.setdefault(s[:-1], []).append(s[-1])
+        front.setdefault(s[1:], []).append(s[0])
+    pairs = list(combinations(range(n), 2))
+    rows = []
+    for w in words:
+        b_stems = b_words = f_stems = f_words = 0
+        b_sol: list[str] = []
+        f_sol: list[str] = []
+        seen: set[str] = set()  # the same stem can come from several position pairs (repeated letters)
+        for i, j in pairs:
+            stem = w[:i] + w[i + 1 : j] + w[j + 1 :]
+            if stem in seen:
+                continue
+            seen.add(stem)
+            b = back.get(stem)
+            f = front.get(stem)
+            if not b and not f:
+                continue
+            dropped = (w[i], w[j])
+            b = [c for c in b if c not in dropped] if b else []
+            f = [c for c in f if c not in dropped] if f else []
+            if not b and not f:
+                continue
+            pattern = "".join(DOT if k in (i, j) else c for k, c in enumerate(w)).upper()
+            if b:
+                b_stems += 1
+                b_words += len(b)
+                b_sol.append(f"{pattern}+{lex.letters(b)}")
+            if f:
+                f_stems += 1
+                f_words += len(f)
+                f_sol.append(f"{lex.letters(f)}+{pattern}")
+        rows.append(
+            (w.upper(), b_stems, b_words, "  ".join(b_sol) or EMPTY,
+             f_stems, f_words, "  ".join(f_sol) or EMPTY, b_words + f_words)
+        )
+    return pd.DataFrame(
+        rows, columns=["word", "bs", "nb", "back", "fs", "nf", "front", "total"]
     )
 
 
@@ -419,21 +495,28 @@ with tab_word:
 # --------------------------------------------------------------------------
 
 with tab_len:
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1], vertical_alignment="bottom")
+    c0, c1, c2, c3, c4 = st.columns([1.6, 1.2, 1, 0.8, 1], vertical_alignment="bottom")
+    any_l = c0.radio(t["mode"], [t["mode_ends"], t["mode_any"]], horizontal=True,
+                     key="mode_l") == t["mode_any"]
     n = c1.select_slider(t["length"], options=lengths,
                          value=5 if 5 in lengths else lengths[0], key="n_l")
     sides = [t["side_all"], t["side_back"], t["side_front"], t["side_both"], t["side_none"]]
-    side = c2.selectbox(t["side"], sides)
-    min_hooks = c3.number_input(t["min_hooks"], 0, 80, 0, step=1)
-    order = c4.selectbox(t["sort"], [t["sort_alpha"], t["sort_hooks"]])
+    side = c2.selectbox(t["side"], sides, key="side_l")
+    min_hooks = c3.number_input(t["min_hooks"], 0, 200, 0, step=1)
+    order = c4.selectbox(t["sort"], [t["sort_alpha"], t["sort_hooks"], t["sort_few"]])
 
-    f1, f2, f3, f4 = st.columns([1, 1, 1, 1.4], vertical_alignment="bottom")
+    f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1.2, 1.4], vertical_alignment="bottom")
     starts = normalize(f1.text_input(t["starts"], key="s_l"))
     ends = normalize(f2.text_input(t["ends"], key="e_l"))
     contains = normalize(f3.text_input(t["contains"], key="c_l"))
-    top = f4.slider(t["rows"], 200, 20000, 2000, step=200)
+    unique = f4.checkbox(t["unique"], value=False, help=t["unique_help"], key="uniq_l")
+    top = f5.slider(t["rows"], 200, 20000, 2000, step=200)
 
-    df = length_table(lex.key, n)
+    if any_l:
+        with st.spinner(t["computing"]):
+            df = any_table(lex.key, n)
+    else:
+        df = length_table(lex.key, n)
     wl = df["word"].str.lower()
     if starts:
         df = df[wl.str.startswith(starts)]
@@ -449,32 +532,73 @@ with tab_len:
         df = df[(df["nb"] > 0) & (df["nf"] > 0)]
     elif side == t["side_none"]:
         df = df[df["total"] == 0]
+    if unique:  # exactly one resulting word on the chosen side(s)
+        # one elimination pattern AND one letter on that side
+        ub = (df["nb"] == 1) & (df.get("bs", 1) == 1)
+        uf = (df["nf"] == 1) & (df.get("fs", 1) == 1)
+        if side == t["side_back"]:
+            df = df[ub]
+        elif side == t["side_front"]:
+            df = df[uf]
+        elif side == t["side_both"]:
+            df = df[ub & uf]
+        else:
+            df = df[(ub & (df["nf"] == 0)) | (uf & (df["nb"] == 0))]
     df = df[df["total"] >= min_hooks].reset_index(drop=True)
     if order == t["sort_hooks"]:
         df = df.sort_values(["total", "word"], ascending=[False, True], ignore_index=True)
+    elif order == t["sort_few"]:
+        df = df[df["total"] > 0].sort_values(["total", "word"], ignore_index=True)
 
     if df.empty:
         st.warning(t["empty"])
     else:
         v1, v2 = st.columns([1, 4], vertical_alignment="center")
-        view = v1.radio("view", [t["view_table"], t["view_text"]], horizontal=True,
+        view = v1.radio("view", [t["view_table"], t["view_text"]], horizontal=True, key="view_l",
                         label_visibility="collapsed")
-        v2.markdown(
-            t["summary"].format(
-                k=f"{len(df):,}".replace(",", " "),
-                b=f"{(df['nb'] > 0).mean():.0%}",
-                f=f"{(df['nf'] > 0).mean():.0%}",
-                t=f"{(df['total'] == 0).mean():.0%}",
+        k = f"{len(df):,}".replace(",", " ")
+        if any_l:
+            v2.markdown(
+                t["summary_any"].format(
+                    k=k,
+                    b=f"{(df['nb'] > 0).mean():.0%}", ub=int((df["nb"] == 1).sum()),
+                    f=f"{(df['nf'] > 0).mean():.0%}", uf=int((df["nf"] == 1).sum()),
+                )
             )
-        )
+        else:
+            v2.markdown(
+                t["summary"].format(
+                    k=k,
+                    b=f"{(df['nb'] > 0).mean():.0%}",
+                    f=f"{(df['nf'] > 0).mean():.0%}",
+                    t=f"{(df['total'] == 0).mean():.0%}",
+                )
+            )
         shown = df.head(top)
-        if view == t["view_table"]:
+        if view == t["view_table"] and any_l:
+            st.dataframe(
+                shown.rename(columns={
+                    "word": t["c_word"], "bs": t["c_bs"], "nb": t["c_nbw"], "back": t["c_back"],
+                    "fs": t["c_fs"], "nf": t["c_nfw"], "front": t["c_front"], "total": t["c_total"],
+                }),
+                hide_index=True, height=600, **WIDE,
+            )
+        elif view == t["view_table"]:
             st.dataframe(
                 shown.rename(columns={
                     "word": t["c_word"], "end": t["c_end"], "back": t["c_back"], "nb": t["c_nb"],
                     "start": t["c_start"], "front": t["c_front"], "nf": t["c_nf"], "total": t["c_total"],
                 }),
                 hide_index=True, height=600, **WIDE,
+            )
+        elif any_l:
+            wb = max(int(shown["back"].str.len().max()), 1)
+            st.code(
+                "\n".join(
+                    f"{w}  ▶ {b:<{wb}}  ◀ {f}".rstrip()
+                    for w, b, f in zip(shown["word"], shown["back"], shown["front"])
+                ),
+                language=None,
             )
         else:
             wb = max(int(shown["back"].str.len().max()), 1)
